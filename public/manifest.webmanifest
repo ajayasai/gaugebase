@@ -1,0 +1,13 @@
+{
+  "name": "GaugeBase — Calibration Control",
+  "short_name": "GaugeBase",
+  "description": "Open-source, local-first calibration and gauge management.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f4f1",
+  "theme_color": "#17231f",
+  "icons": [
+    { "src": "./favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

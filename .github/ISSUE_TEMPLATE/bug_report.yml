@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible problem in GaugeBase
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not report security vulnerabilities here. Use the private Security reporting flow.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and exact steps to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Browser and operating system
+    validations:
+      required: true
+  - type: checkboxes
+    id: data
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed customer data, certificates, email addresses, and secrets from this report.
+          required: true

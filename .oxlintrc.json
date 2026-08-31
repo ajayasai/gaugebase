@@ -1,0 +1,7 @@
+{
+  "rules": {
+    "react/react-compiler": "off",
+    "jsx-a11y/label-has-associated-control": "off",
+    "typescript/no-deprecated": "off"
+  }
+}

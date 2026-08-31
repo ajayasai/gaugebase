@@ -1,0 +1,21 @@
+name: Feature request
+description: Propose an operator workflow or interoperability improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Operator problem
+      description: Describe the job, constraint, or failure mode—not only the proposed UI.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+  - type: textarea
+    id: data-model
+    attributes:
+      label: Records, exports, or compliance implications
+      description: Note any migration, audit, retention, approval, or compatibility concerns.
