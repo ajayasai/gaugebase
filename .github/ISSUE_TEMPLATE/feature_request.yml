@@ -1,6 +1,6 @@
 name: Feature request
 description: Propose an operator workflow or interoperability improvement
-title: "[Feature]: "
+title: '[Feature]: '
 labels: [enhancement]
 body:
   - type: textarea

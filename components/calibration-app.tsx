@@ -1,6 +1,8 @@
 'use client';
 
 import {
+  lazy,
+  Suspense,
   useEffect,
   useMemo,
   useRef,
@@ -34,6 +36,7 @@ import {
   LockKeyhole,
   MapPin,
   Menu,
+  Microscope,
   PackageOpen,
   Paperclip,
   Pencil,
@@ -44,9 +47,11 @@ import {
   Search,
   Send,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   Upload,
   UserRound,
+  Users,
   Wrench,
   X,
   Zap,
@@ -81,7 +86,9 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
-import { loadWorkspace, saveWorkspace } from '@/lib/database';
+import type { TeamSyncStatus } from '@/components/team-control';
+import type { ChatGPTUser } from '@/app/chatgpt-auth';
+import { loadWorkspace, migrateWorkspace, saveWorkspace } from '@/lib/database';
 import {
   addMonthsClamped,
   appendAudit,
@@ -89,19 +96,41 @@ import {
   daysUntil,
   formatDate,
   getCalibrationState,
-  hashValue,
   isoNow,
-  readingResult,
   stateLabel,
   todayIso,
   uid,
   verifyAuditChain,
   type AppState,
+  type AttachmentRecord,
   type CalibrationRecord,
   type CalibrationResult,
   type GaugeRecord,
   type Reading,
 } from '@/lib/model';
+import {
+  sealCalibrationRecord,
+  sha256Bytes,
+  validateReadingRows,
+  verifySealedCalibration,
+} from '@/lib/record-integrity';
+import { evaluateDecisionRule } from '@/lib/metrology';
+import {
+  approveRemoteCalibration,
+  cancelRemoteInvite,
+  createRemoteWorkspace,
+  fetchTeamOverview,
+  inviteRemoteMember,
+  loadRemoteWorkspace,
+  syncRemoteWorkspace,
+  teamStateHash,
+  uploadTeamAttachment,
+  updateRemoteMember,
+  type TeamOverview,
+  type TeamSession,
+  type TeamWorkspacePayload,
+} from '@/lib/team-client';
+import type { TeamRole } from '@/lib/team-server';
 import {
   downloadAttachment,
   downloadCsvTemplate,
@@ -115,14 +144,33 @@ import {
   importBackup,
   importedGauge,
   parseGaugeCsv,
+  verifyCertificatePair,
   type CsvPreview,
 } from '@/lib/workspace-actions';
+
+const MetrologyCenter = lazy(() =>
+  import('@/components/metrology-center').then((module) => ({
+    default: module.MetrologyCenter,
+  })),
+);
+const QualityCenter = lazy(() =>
+  import('@/components/quality-center').then((module) => ({
+    default: module.QualityCenter,
+  })),
+);
+const TeamControl = lazy(() =>
+  import('@/components/team-control').then((module) => ({
+    default: module.TeamControl,
+  })),
+);
 
 type View =
   | 'dashboard'
   | 'register'
   | 'calibrations'
   | 'schedule'
+  | 'metrology'
+  | 'quality'
   | 'labels'
   | 'audit'
   | 'settings';
@@ -133,11 +181,27 @@ type ToastMessage = {
   tone?: 'good' | 'warning' | 'danger';
 };
 
+function isAllowedReminderWebhook(value: string) {
+  if (!value.trim()) return true;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' ||
+      (url.protocol === 'http:' &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
+
 const navItems: Array<{ key: View; label: string; icon: typeof Gauge }> = [
   { key: 'dashboard', label: 'Overview', icon: LayoutDashboard },
   { key: 'register', label: 'Gauge register', icon: Gauge },
   { key: 'calibrations', label: 'Calibrations', icon: ClipboardCheck },
   { key: 'schedule', label: 'Schedule', icon: CalendarClock },
+  { key: 'metrology', label: 'Metrology lab', icon: Microscope },
+  { key: 'quality', label: 'Quality center', icon: ShieldAlert },
   { key: 'labels', label: 'Labels', icon: QrCode },
   { key: 'audit', label: 'Audit log', icon: History },
 ];
@@ -208,9 +272,19 @@ function StatusPill({ gauge }: { gauge: GaugeRecord }) {
   );
 }
 
-export function CalibrationApp() {
+export function CalibrationApp({
+  identity,
+  signInPath,
+  signOutPath,
+}: {
+  identity: ChatGPTUser | null;
+  signInPath: string;
+  signOutPath: string;
+}) {
   const [state, setState] = useState<AppState>(() => createSeedState());
   const [hydrated, setHydrated] = useState(false);
+  const [storageWritable, setStorageWritable] = useState(false);
+  const [storageError, setStorageError] = useState<string>();
   const [view, setView] = useState<View>('dashboard');
   const [search, setSearch] = useState('');
   const [selectedGaugeId, setSelectedGaugeId] = useState<string>();
@@ -221,7 +295,19 @@ export function CalibrationApp() {
   const [importOpen, setImportOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [teamOverview, setTeamOverview] = useState<TeamOverview>();
+  const [teamSession, setTeamSession] = useState<TeamSession>();
+  const [teamDetails, setTeamDetails] = useState<TeamWorkspacePayload>();
+  const [teamStatus, setTeamStatus] = useState<TeamSyncStatus>('local');
+  const [teamError, setTeamError] = useState<string>();
   const searchRef = useRef<HTMLInputElement>(null);
+  const localStateBeforeTeam = useRef<AppState | undefined>(undefined);
+  const restoredTeamOnce = useRef(false);
+  const workspaceEditable =
+    !teamSession ||
+    ['owner', 'admin', 'quality-manager', 'technician'].includes(
+      teamSession.role,
+    );
 
   const toast = (
     title: string,
@@ -237,15 +323,259 @@ export function CalibrationApp() {
     );
   };
 
+  const refreshTeam = async () => {
+    if (!identity) return;
+    try {
+      const overview = await fetchTeamOverview();
+      setTeamOverview(overview);
+      setTeamError(undefined);
+      return overview;
+    } catch (error) {
+      setTeamError(
+        error instanceof Error
+          ? error.message
+          : 'Team workspaces are unavailable.',
+      );
+      throw error;
+    }
+  };
+
+  const openTeamWorkspace = async (
+    workspaceId: string,
+    preserveLocal = true,
+  ) => {
+    setTeamStatus('connecting');
+    setTeamError(undefined);
+    try {
+      const remote = await loadRemoteWorkspace(workspaceId);
+      if (preserveLocal && !teamSession) localStateBeforeTeam.current = state;
+      const migrated = migrateWorkspace(remote.state);
+      const lastSyncedHash = teamStateHash(migrated);
+      setState(migrated);
+      setTeamDetails({ ...remote, state: migrated });
+      setTeamSession({
+        workspaceId: remote.workspaceId,
+        name: remote.name,
+        role: remote.role,
+        version: remote.version,
+        lastSyncedHash,
+        lastSyncedAt: new Date().toISOString(),
+      });
+      window.localStorage.setItem(
+        'gaugebase.activeTeamWorkspace',
+        remote.workspaceId,
+      );
+      setTeamStatus('synced');
+      toast('Team workspace opened', `${remote.name} · ${remote.role}`);
+    } catch (error) {
+      setTeamStatus('error');
+      setTeamError(
+        error instanceof Error
+          ? error.message
+          : 'Team workspace could not be opened.',
+      );
+    }
+  };
+
+  const createTeamWorkspace = async (name: string) => {
+    setTeamStatus('connecting');
+    setTeamError(undefined);
+    try {
+      const created = await createRemoteWorkspace(name, state);
+      await refreshTeam();
+      await openTeamWorkspace(created.id);
+    } catch (error) {
+      setTeamStatus('error');
+      setTeamError(
+        error instanceof Error
+          ? error.message
+          : 'Team workspace could not be created.',
+      );
+    }
+  };
+
+  const disconnectTeam = () => {
+    const local = localStateBeforeTeam.current;
+    setTeamSession(undefined);
+    setTeamDetails(undefined);
+    setTeamStatus('local');
+    setTeamError(undefined);
+    window.localStorage.removeItem('gaugebase.activeTeamWorkspace');
+    if (local) setState(local);
+    toast(
+      'Local mode restored',
+      'Shared workspace synchronization is disconnected.',
+    );
+  };
+
+  const refreshActiveWorkspace = async () => {
+    if (!teamSession) return;
+    const remote = await loadRemoteWorkspace(teamSession.workspaceId);
+    const migrated = migrateWorkspace(remote.state);
+    setState(migrated);
+    setTeamDetails({ ...remote, state: migrated });
+    setTeamSession({
+      workspaceId: remote.workspaceId,
+      name: remote.name,
+      role: remote.role,
+      version: remote.version,
+      lastSyncedHash: teamStateHash(migrated),
+      lastSyncedAt: new Date().toISOString(),
+    });
+    setTeamStatus('synced');
+    setTeamError(undefined);
+  };
+
+  const inviteTeam = async (
+    email: string,
+    role: Exclude<TeamRole, 'owner'>,
+  ) => {
+    if (!teamSession) return;
+    try {
+      await inviteRemoteMember({
+        workspaceId: teamSession.workspaceId,
+        email,
+        role,
+      });
+      await refreshActiveWorkspace();
+      toast('Team invitation recorded', `${email} · ${role}`);
+    } catch (error) {
+      setTeamError(
+        error instanceof Error ? error.message : 'Invitation failed.',
+      );
+    }
+  };
+
+  const updateTeamMemberAccess = async (
+    targetUserId: string,
+    role: Exclude<TeamRole, 'owner'>,
+    active: boolean,
+  ) => {
+    if (!teamSession) return;
+    try {
+      await updateRemoteMember({
+        workspaceId: teamSession.workspaceId,
+        targetUserId,
+        role,
+        active,
+      });
+      await refreshActiveWorkspace();
+      toast(
+        active ? 'Member role updated' : 'Member access deactivated',
+        active
+          ? `Assigned ${role}`
+          : 'The identity can no longer open this workspace.',
+      );
+    } catch (error) {
+      setTeamError(
+        error instanceof Error ? error.message : 'Member update failed.',
+      );
+    }
+  };
+
+  const cancelTeamInvitation = async (inviteId: string) => {
+    if (!teamSession) return;
+    try {
+      await cancelRemoteInvite({
+        workspaceId: teamSession.workspaceId,
+        inviteId,
+      });
+      await refreshActiveWorkspace();
+      toast('Invitation cancelled');
+    } catch (error) {
+      setTeamError(
+        error instanceof Error
+          ? error.message
+          : 'Invitation cancellation failed.',
+      );
+    }
+  };
+
+  useEffect(() => {
+    if (!hydrated || !identity || restoredTeamOnce.current) return;
+    restoredTeamOnce.current = true;
+    refreshTeam()
+      .then(() => {
+        const activeId = window.localStorage.getItem(
+          'gaugebase.activeTeamWorkspace',
+        );
+        if (activeId) return openTeamWorkspace(activeId, false);
+      })
+      .catch(() => undefined);
+  }, [hydrated, identity]);
+
+  useEffect(() => {
+    if (
+      !hydrated ||
+      !teamSession ||
+      teamStatus !== 'synced' ||
+      !['owner', 'admin', 'quality-manager', 'technician'].includes(
+        teamSession.role,
+      )
+    )
+      return;
+    const outgoingHash = teamStateHash(state);
+    if (outgoingHash === teamSession.lastSyncedHash) return;
+    const timer = window.setTimeout(() => {
+      setTeamStatus('syncing');
+      syncRemoteWorkspace({
+        session: teamSession,
+        state,
+        summary: `Workspace synchronized by ${identity?.email ?? state.settings.actorEmail}`,
+      })
+        .then((result) => {
+          const synchronized = migrateWorkspace(result.state);
+          const synchronizedHash = teamStateHash(synchronized);
+          setState(synchronized);
+          setTeamSession((current) =>
+            current
+              ? {
+                  ...current,
+                  version: result.version,
+                  lastSyncedHash: synchronizedHash,
+                  lastSyncedAt: result.updatedAt,
+                }
+              : current,
+          );
+          setTeamDetails((current) =>
+            current
+              ? {
+                  ...current,
+                  version: result.version,
+                  stateHash: result.stateHash,
+                  state: synchronized,
+                  updatedAt: result.updatedAt,
+                }
+              : current,
+          );
+          setTeamStatus('synced');
+          setTeamError(undefined);
+        })
+        .catch((error: Error & { status?: number }) => {
+          setTeamStatus(error.status === 409 ? 'conflict' : 'error');
+          setTeamError(error.message);
+        });
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [state, teamSession, teamStatus, hydrated, identity]);
+
   useEffect(() => {
     loadWorkspace()
       .then((stored) => {
-        if (stored?.schemaVersion === 1) setState(stored);
+        if (stored?.schemaVersion === 2) setState(stored);
+        setStorageWritable(true);
         setHydrated(true);
       })
-      .catch(() => setHydrated(true));
+      .catch((error) => {
+        setStorageError(
+          error instanceof Error
+            ? error.message
+            : 'The local workspace could not be opened.',
+        );
+        setHydrated(true);
+      });
     if ('serviceWorker' in navigator)
-      navigator.serviceWorker.register('./sw.js').catch(() => undefined);
+      navigator.serviceWorker.register('/sw.js').catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -261,7 +591,7 @@ export function CalibrationApp() {
   }, [hydrated, state.gauges]);
 
   useEffect(() => {
-    if (hydrated)
+    if (hydrated && storageWritable && !teamSession)
       saveWorkspace(state).catch(() =>
         toast(
           'Local save failed',
@@ -269,7 +599,7 @@ export function CalibrationApp() {
           'danger',
         ),
       );
-  }, [state, hydrated]);
+  }, [state, hydrated, storageWritable, teamSession]);
 
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
@@ -297,7 +627,9 @@ export function CalibrationApp() {
           gauge.serial,
           gauge.location,
           gauge.manufacturer,
-        ].some((value) => value.toLowerCase().includes(query)),
+          gauge.site,
+          gauge.department,
+        ].some((value) => (value ?? '').toLowerCase().includes(query)),
       )
       .slice(0, 6);
   }, [search, state.gauges]);
@@ -313,15 +645,28 @@ export function CalibrationApp() {
     window.history.replaceState(null, '', `#${next}`);
   };
   const editGauge = (id: string) => {
+    if (!workspaceEditable)
+      return toast(
+        'Read-only team role',
+        'Ask an owner or administrator to change your workspace role.',
+        'warning',
+      );
     setEditingGaugeId(id);
     setGaugeDialogOpen(true);
   };
   const newGauge = () => {
+    if (!workspaceEditable)
+      return toast(
+        'Read-only team role',
+        'This workspace role cannot add equipment.',
+        'warning',
+      );
     setEditingGaugeId(undefined);
     setGaugeDialogOpen(true);
   };
 
   const upsertGauge = (gauge: GaugeRecord, previous?: GaugeRecord) => {
+    if (!workspaceEditable) return;
     setState((current) => {
       const gauges = previous
         ? current.gauges.map((item) => (item.id === gauge.id ? gauge : item))
@@ -360,16 +705,55 @@ export function CalibrationApp() {
     calibration: CalibrationRecord,
     gauge: GaugeRecord,
   ) => {
+    if (!workspaceEditable) return;
     setState((current) => {
       const previousGauge = current.gauges.find(
         (item) => item.id === gauge.id,
       )!;
+      const sequence = current.qualityCases.length + 1;
+      const qualityCase =
+        calibration.result === 'pass'
+          ? undefined
+          : {
+              id: uid('case'),
+              caseNumber: `Q-${new Date().getFullYear()}-${String(sequence).padStart(4, '0')}`,
+              type:
+                calibration.result === 'fail'
+                  ? ('out-of-tolerance' as const)
+                  : ('deviation' as const),
+              status: 'open' as const,
+              severity:
+                calibration.result === 'fail'
+                  ? ('high' as const)
+                  : ('medium' as const),
+              title:
+                calibration.result === 'fail'
+                  ? `${gauge.assetId} failed calibration`
+                  : `${gauge.assetId} released with restricted use`,
+              description:
+                calibration.result === 'fail'
+                  ? 'Assess results produced since the previous acceptable calibration, contain the equipment, and document disposition.'
+                  : (calibration.condition ??
+                    'Document the approved use restriction and review before expiry.'),
+              gaugeId: gauge.id,
+              calibrationId: calibration.id,
+              owner: current.settings.actorName,
+              dueDate: calibration.restrictionExpiry,
+              impactWindowStart: previousGauge.lastCalibrated,
+              impactWindowEnd: calibration.performedOn,
+              affectedGaugeIds: [],
+              createdAt: calibration.createdAt,
+              updatedAt: calibration.createdAt,
+            };
       return {
         ...current,
         gauges: current.gauges.map((item) =>
           item.id === gauge.id ? gauge : item,
         ),
         calibrations: [calibration, ...current.calibrations],
+        qualityCases: qualityCase
+          ? [qualityCase, ...current.qualityCases]
+          : current.qualityCases,
         audit: appendAudit(current.audit, {
           actor: current.settings.actorName,
           action: 'calibration.completed',
@@ -392,30 +776,89 @@ export function CalibrationApp() {
     );
   };
 
+  const downloadCertificate = async (
+    calibration: CalibrationRecord,
+    gauge: GaugeRecord,
+  ) => {
+    try {
+      await generateCertificatePdf(state, calibration, gauge);
+      toast(
+        'Certificate and manifest generated',
+        'Keep both files together to verify the downloaded PDF bytes.',
+      );
+    } catch (error) {
+      toast(
+        'Certificate generation locked',
+        error instanceof Error
+          ? error.message
+          : 'The record could not be verified.',
+        'danger',
+      );
+    }
+  };
+
   const addAttachments = async (gauge: GaugeRecord, files: FileList) => {
-    const accepted = Array.from(files).filter((file) => file.size <= 5_000_000);
+    if (!workspaceEditable) return;
+    if (
+      teamSession &&
+      !teamDetails?.state.gauges.some((item) => item.id === gauge.id)
+    )
+      return toast(
+        'Wait for team synchronization',
+        'The gauge must reach the server before shared evidence can be attached.',
+        'warning',
+      );
+    const limit = teamSession ? 20_000_000 : 5_000_000;
+    const accepted = Array.from(files).filter((file) => file.size <= limit);
     if (accepted.length !== files.length)
       toast(
         'Some files were skipped',
-        'Attachments are limited to 5 MB each.',
+        `Attachments are limited to ${teamSession ? 20 : 5} MB each.`,
         'warning',
       );
-    const attachments = await Promise.all(
-      accepted.map(async (file) => {
-        const dataUrl = await fileToDataUrl(file);
-        return {
-          id: uid('attachment'),
-          name: file.name,
-          type: file.type || 'application/octet-stream',
-          size: file.size,
-          dataUrl,
-          sha256: hashValue(dataUrl),
-          createdAt: isoNow(),
-          targetType: 'gauge' as const,
-          targetId: gauge.id,
-        };
-      }),
-    );
+    let attachments: AttachmentRecord[];
+    try {
+      attachments = teamSession
+        ? await Promise.all(
+            accepted.map((file) =>
+              uploadTeamAttachment({
+                workspaceId: teamSession.workspaceId,
+                targetType: 'gauge',
+                targetId: gauge.id,
+                file,
+              }),
+            ),
+          )
+        : await Promise.all(
+            accepted.map(async (file) => {
+              const [dataUrl, sha256] = await Promise.all([
+                fileToDataUrl(file),
+                file.arrayBuffer().then(sha256Bytes),
+              ]);
+              return {
+                id: uid('attachment'),
+                name: file.name,
+                type: file.type || 'application/octet-stream',
+                size: file.size,
+                dataUrl,
+                storage: 'local' as const,
+                sha256,
+                createdAt: isoNow(),
+                targetType: 'gauge' as const,
+                targetId: gauge.id,
+              };
+            }),
+          );
+    } catch (error) {
+      toast(
+        'Attachment upload failed',
+        error instanceof Error
+          ? error.message
+          : 'The file could not be stored.',
+        'danger',
+      );
+      return;
+    }
     if (!attachments.length) return;
     setState((current) => {
       const updated = {
@@ -446,15 +889,199 @@ export function CalibrationApp() {
     });
     toast(
       'Attachment saved',
-      `${attachments.length} file${attachments.length === 1 ? '' : 's'} stored on this device.`,
+      `${attachments.length} file${attachments.length === 1 ? '' : 's'} stored ${teamSession ? 'in shared evidence storage' : 'on this device'}.`,
+    );
+  };
+
+  const addCalibrationAttachments = async (
+    calibration: CalibrationRecord,
+    files: FileList,
+  ) => {
+    if (!workspaceEditable) return;
+    if (
+      teamSession &&
+      !teamDetails?.state.calibrations.some(
+        (item) => item.id === calibration.id,
+      )
+    )
+      return toast(
+        'Wait for team synchronization',
+        'The calibration must reach the server before shared evidence can be attached.',
+        'warning',
+      );
+    const limit = teamSession ? 20_000_000 : 5_000_000;
+    const accepted = Array.from(files).filter((file) => file.size <= limit);
+    if (accepted.length !== files.length)
+      toast(
+        'Some files were skipped',
+        `Attachments are limited to ${teamSession ? 20 : 5} MB each.`,
+        'warning',
+      );
+    let attachments: AttachmentRecord[];
+    try {
+      attachments = teamSession
+        ? await Promise.all(
+            accepted.map((file) =>
+              uploadTeamAttachment({
+                workspaceId: teamSession.workspaceId,
+                targetType: 'calibration',
+                targetId: calibration.id,
+                file,
+              }),
+            ),
+          )
+        : await Promise.all(
+            accepted.map(async (file) => {
+              const [dataUrl, sha256] = await Promise.all([
+                fileToDataUrl(file),
+                file.arrayBuffer().then(sha256Bytes),
+              ]);
+              return {
+                id: uid('attachment'),
+                name: file.name,
+                type: file.type || 'application/octet-stream',
+                size: file.size,
+                dataUrl,
+                storage: 'local' as const,
+                sha256,
+                createdAt: isoNow(),
+                targetType: 'calibration' as const,
+                targetId: calibration.id,
+              };
+            }),
+          );
+    } catch (error) {
+      toast(
+        'Evidence upload failed',
+        error instanceof Error
+          ? error.message
+          : 'The file could not be stored.',
+        'danger',
+      );
+      return;
+    }
+    if (!attachments.length) return;
+    setState((current) => ({
+      ...current,
+      attachments: [...current.attachments, ...attachments],
+      calibrations: current.calibrations.map((item) =>
+        item.id === calibration.id
+          ? {
+              ...item,
+              attachmentIds: [
+                ...item.attachmentIds,
+                ...attachments.map((attachment) => attachment.id),
+              ],
+            }
+          : item,
+      ),
+      audit: appendAudit(current.audit, {
+        actor: current.settings.actorName,
+        action: 'attachment.linked',
+        entityType: 'attachment',
+        entityId: attachments[0].id,
+        summary: `${attachments.length} file${attachments.length === 1 ? '' : 's'} linked to ${calibration.certificateNumber}`,
+        after: attachments.map(
+          ({ dataUrl: _data, ...attachment }) => attachment,
+        ),
+      }),
+    }));
+    toast(
+      'Calibration evidence attached',
+      `${attachments.length} file${attachments.length === 1 ? '' : 's'} linked to ${calibration.certificateNumber}.`,
+    );
+  };
+
+  const approveCalibration = async (calibration: CalibrationRecord) => {
+    if (!calibration.recordHash)
+      return toast(
+        'Approval unavailable',
+        'Migrate or supersede this legacy record to create a sealed record hash.',
+        'danger',
+      );
+    if (teamSession) {
+      if (teamStatus !== 'synced')
+        return toast(
+          'Wait for team synchronization',
+          'The authenticated approval must bind to the current server version.',
+          'warning',
+        );
+      try {
+        setTeamStatus('syncing');
+        const result = await approveRemoteCalibration({
+          session: teamSession,
+          calibrationId: calibration.id,
+          recordHash: calibration.recordHash,
+          meaning: 'technical-review',
+        });
+        const migrated = migrateWorkspace(result.state);
+        setState(migrated);
+        setTeamSession((current) =>
+          current
+            ? {
+                ...current,
+                version: result.version,
+                lastSyncedHash: teamStateHash(migrated),
+                lastSyncedAt: new Date().toISOString(),
+              }
+            : current,
+        );
+        setTeamStatus('synced');
+        toast(
+          'Authenticated technical review recorded',
+          `${result.approval.signerEmail} signed the sealed record hash.`,
+        );
+      } catch (error) {
+        const failure = error as Error & { status?: number };
+        setTeamStatus(failure.status === 409 ? 'conflict' : 'error');
+        setTeamError(failure.message);
+        toast('Approval failed', failure.message, 'danger');
+      }
+      return;
+    }
+    const approval = {
+      id: uid('approval'),
+      meaning: 'technical-review' as const,
+      signerName: state.settings.actorName,
+      signerEmail: state.settings.actorEmail,
+      signerRole: 'Quality reviewer',
+      signedAt: isoNow(),
+      recordHash: calibration.recordHash,
+      assurance: 'local-assertion' as const,
+    };
+    setState((current) => ({
+      ...current,
+      calibrations: current.calibrations.map((item) =>
+        item.id === calibration.id
+          ? { ...item, approvals: [...(item.approvals ?? []), approval] }
+          : item,
+      ),
+      audit: appendAudit(current.audit, {
+        actor: current.settings.actorName,
+        action: 'calibration.technical-review-signed',
+        entityType: 'approval',
+        entityId: approval.id,
+        summary: `${calibration.certificateNumber} technically reviewed by ${current.settings.actorName}`,
+        after: approval,
+      }),
+    }));
+    toast(
+      'Technical review recorded',
+      'The approval is bound to the sealed record hash. Local identity is asserted, not independently authenticated.',
     );
   };
 
   const openCalibration = (gaugeId?: string) =>
-    setCalibrationDialogGaugeId(
-      gaugeId ??
-        state.gauges.find((gauge) => gauge.lifecycle !== 'retired')?.id,
-    );
+    workspaceEditable
+      ? setCalibrationDialogGaugeId(
+          gaugeId ??
+            state.gauges.find((gauge) => gauge.lifecycle !== 'retired')?.id,
+        )
+      : toast(
+          'Read-only team role',
+          'This workspace role cannot record calibrations.',
+          'warning',
+        );
   const counts = useMemo(() => {
     const status = state.gauges.map(getCalibrationState);
     return {
@@ -462,7 +1089,7 @@ export function CalibrationApp() {
       dueSoon: status.filter((item) => item === 'due-soon').length,
       current: status.filter((item) => item === 'current').length,
       unavailable: status.filter((item) =>
-        ['failed', 'conditional'].includes(item),
+        ['failed', 'conditional', 'restriction-expired'].includes(item),
       ).length,
     };
   }, [state.gauges]);
@@ -504,10 +1131,16 @@ export function CalibrationApp() {
         </nav>
         <div className="sidebar-bottom">
           <div className="data-card">
-            <ShieldCheck size={18} />
+            {teamSession ? <Users size={18} /> : <ShieldCheck size={18} />}
             <div>
-              <strong>Your data stays yours</strong>
-              <p>Stored on this device. Export a backup anytime.</p>
+              <strong>
+                {teamSession ? teamSession.name : 'Your data stays yours'}
+              </strong>
+              <p>
+                {teamSession
+                  ? `${teamSession.role} · ${teamStatus}`
+                  : 'Stored on this device. Export a backup anytime.'}
+              </p>
             </div>
           </div>
           <button
@@ -527,18 +1160,48 @@ export function CalibrationApp() {
                 .toUpperCase()}
             </span>
             <span>
-              <strong>{state.settings.actorName}</strong>
-              <small>Quality manager</small>
+              <strong>
+                {identity?.displayName ?? state.settings.actorName}
+              </strong>
+              <small>{teamSession?.role ?? 'Local quality manager'}</small>
             </span>
             <span
               className="online-dot"
-              title={hydrated ? 'Saved locally' : 'Loading local workspace'}
+              title={
+                teamSession
+                  ? `Team workspace ${teamStatus}`
+                  : hydrated
+                    ? 'Saved locally'
+                    : 'Loading local workspace'
+              }
             />
           </div>
         </div>
       </aside>
 
       <section className="workspace">
+        {storageError && (
+          <div className="storage-error-banner" role="alert">
+            <AlertTriangle size={18} />
+            <div>
+              <strong>Local storage is in read-only recovery mode</strong>
+              <p>{storageError} GaugeBase will not overwrite stored data.</p>
+            </div>
+          </div>
+        )}
+        {teamSession && !workspaceEditable && (
+          <div className="readonly-team-banner" role="status">
+            <ShieldCheck size={18} />
+            <div>
+              <strong>{teamSession.role} access is read-only</strong>
+              <p>
+                Records, evidence, and history remain available. Server-side
+                authorization blocks edits; reviewers can still sign eligible
+                records.
+              </p>
+            </div>
+          </div>
+        )}
         <header className="topbar">
           <button
             className="mobile-menu"
@@ -599,92 +1262,237 @@ export function CalibrationApp() {
           </div>
         </header>
         <div className="content app-content">
-          {view === 'dashboard' && (
-            <DashboardView
-              state={state}
-              counts={counts}
-              openGauge={openGauge}
-              openCalibration={openCalibration}
-              goTo={goTo}
-            />
-          )}
-          {view === 'register' && (
-            <RegisterView
-              state={state}
-              openGauge={openGauge}
-              newGauge={newGauge}
-              openImport={() => setImportOpen(true)}
-              exportCsv={() => {
-                exportGaugesCsv(state.gauges);
-                setState((current) => ({
-                  ...current,
-                  audit: appendAudit(current.audit, {
-                    actor: current.settings.actorName,
-                    action: 'export.gauges',
-                    entityType: 'export',
-                    entityId: uid('export'),
-                    summary: `${current.gauges.length} gauge records exported to CSV`,
-                  }),
-                }));
-                toast(
-                  'CSV exported',
-                  `${state.gauges.length} gauge records downloaded.`,
-                );
-              }}
-            />
-          )}
-          {view === 'calibrations' && (
-            <CalibrationsView
-              state={state}
-              openCalibration={openCalibration}
-              openGauge={openGauge}
-              downloadCertificate={(calibration, gauge) =>
-                generateCertificatePdf(state, calibration, gauge)
-              }
-            />
-          )}
-          {view === 'schedule' && (
-            <ScheduleView
-              state={state}
-              setState={setState}
-              openGauge={openGauge}
-              goTo={goTo}
-              toast={toast}
-            />
-          )}
-          {view === 'labels' && (
-            <LabelsView
-              state={state}
-              setState={setState}
-              initialGaugeId={selectedGaugeId}
-              toast={toast}
-            />
-          )}
-          {view === 'audit' && (
-            <AuditView
-              state={state}
-              exportAudit={() => {
-                exportAuditCsv(state.audit);
-                setState((current) => ({
-                  ...current,
-                  audit: appendAudit(current.audit, {
-                    actor: current.settings.actorName,
-                    action: 'export.audit',
-                    entityType: 'export',
-                    entityId: uid('export'),
-                    summary: `${current.audit.length} audit entries exported with hash chain`,
-                  }),
-                }));
-                toast(
-                  'Audit log exported',
-                  'The CSV includes every entry hash and its predecessor.',
-                );
-              }}
-            />
-          )}
-          {view === 'settings' && (
-            <SettingsView state={state} setState={setState} toast={toast} />
-          )}
+          <Suspense
+            fallback={
+              <div className="calc-empty">
+                <Activity />
+                <strong>Loading workspace module…</strong>
+              </div>
+            }
+          >
+            {view === 'dashboard' && (
+              <DashboardView
+                state={state}
+                counts={counts}
+                openGauge={openGauge}
+                openCalibration={openCalibration}
+                goTo={goTo}
+              />
+            )}
+            {view === 'register' && (
+              <RegisterView
+                state={state}
+                openGauge={openGauge}
+                newGauge={newGauge}
+                openImport={() =>
+                  workspaceEditable
+                    ? setImportOpen(true)
+                    : toast(
+                        'Read-only team role',
+                        'This workspace role cannot import equipment.',
+                        'warning',
+                      )
+                }
+                exportCsv={() => {
+                  exportGaugesCsv(state.gauges);
+                  setState((current) => ({
+                    ...current,
+                    audit: appendAudit(current.audit, {
+                      actor: current.settings.actorName,
+                      action: 'export.gauges',
+                      entityType: 'export',
+                      entityId: uid('export'),
+                      summary: `${current.gauges.length} gauge records exported to CSV`,
+                    }),
+                  }));
+                  toast(
+                    'CSV exported',
+                    `${state.gauges.length} gauge records downloaded.`,
+                  );
+                }}
+              />
+            )}
+            {view === 'calibrations' && (
+              <CalibrationsView
+                state={state}
+                openCalibration={openCalibration}
+                openGauge={openGauge}
+                downloadCertificate={downloadCertificate}
+              />
+            )}
+            {view === 'schedule' && (
+              <ScheduleView
+                state={state}
+                setState={setState}
+                openGauge={openGauge}
+                goTo={goTo}
+                toast={toast}
+              />
+            )}
+            {view === 'metrology' && (
+              <MetrologyCenter
+                gauges={state.gauges}
+                studies={state.technicalStudies}
+                actor={identity?.displayName ?? state.settings.actorName}
+                saveStatus={
+                  teamSession?.role === 'technician' ? 'draft' : 'reviewed'
+                }
+                onSaveStudy={(study) => {
+                  if (!workspaceEditable) {
+                    toast(
+                      'Read-only team role',
+                      'This workspace role cannot save technical studies.',
+                      'warning',
+                    );
+                    return;
+                  }
+                  setState((current) => ({
+                    ...current,
+                    technicalStudies: [study, ...current.technicalStudies],
+                    audit: appendAudit(current.audit, {
+                      actor: current.settings.actorName,
+                      action: 'technical-study.reviewed',
+                      entityType: 'technical-study',
+                      entityId: study.id,
+                      summary: `${study.title} saved as a reviewed ${study.kind === 'gage-rr' ? 'Gage R&R' : 'uncertainty'} study`,
+                      after: study,
+                    }),
+                  }));
+                  toast('Technical study saved', study.title);
+                }}
+              />
+            )}
+            {view === 'quality' && (
+              <QualityCenter
+                state={state}
+                openGauge={openGauge}
+                canCloseCases={
+                  !teamSession ||
+                  ['owner', 'admin', 'quality-manager'].includes(
+                    teamSession.role,
+                  )
+                }
+                onApplyInterval={(gaugeId, intervalMonths) => {
+                  const gauge = state.gauges.find(
+                    (item) => item.id === gaugeId,
+                  );
+                  if (!gauge || !workspaceEditable) return;
+                  upsertGauge(
+                    {
+                      ...gauge,
+                      intervalMonths,
+                      nextDue: gauge.lastCalibrated
+                        ? addMonthsClamped(gauge.lastCalibrated, intervalMonths)
+                        : gauge.nextDue,
+                      updatedAt: isoNow(),
+                    },
+                    gauge,
+                  );
+                  toast(
+                    'Reviewed interval applied',
+                    `${gauge.assetId} now uses a ${intervalMonths}-month interval.`,
+                  );
+                }}
+                onUpsertCase={(record, previous) => {
+                  if (!workspaceEditable) {
+                    toast(
+                      'Read-only team role',
+                      'This workspace role cannot change quality cases.',
+                      'warning',
+                    );
+                    return;
+                  }
+                  setState((current) => ({
+                    ...current,
+                    qualityCases: previous
+                      ? current.qualityCases.map((item) =>
+                          item.id === record.id ? record : item,
+                        )
+                      : [record, ...current.qualityCases],
+                    audit: appendAudit(current.audit, {
+                      actor: current.settings.actorName,
+                      action: previous
+                        ? 'quality-case.updated'
+                        : 'quality-case.opened',
+                      entityType: 'quality-case',
+                      entityId: record.id,
+                      summary: `${record.caseNumber} ${previous ? `moved to ${record.status}` : 'opened'}`,
+                      before: previous,
+                      after: record,
+                    }),
+                  }));
+                  toast(
+                    previous ? 'Quality case updated' : 'Quality case opened',
+                    record.caseNumber,
+                    record.severity === 'critical' ? 'danger' : 'warning',
+                  );
+                }}
+              />
+            )}
+            {view === 'labels' && (
+              <LabelsView
+                state={state}
+                setState={setState}
+                initialGaugeId={selectedGaugeId}
+                toast={toast}
+              />
+            )}
+            {view === 'audit' && (
+              <AuditView
+                state={state}
+                exportAudit={() => {
+                  exportAuditCsv(state.audit);
+                  setState((current) => ({
+                    ...current,
+                    audit: appendAudit(current.audit, {
+                      actor: current.settings.actorName,
+                      action: 'export.audit',
+                      entityType: 'export',
+                      entityId: uid('export'),
+                      summary: `${current.audit.length} audit entries exported with hash chain`,
+                    }),
+                  }));
+                  toast(
+                    'Audit log exported',
+                    'The CSV includes every entry hash and its predecessor.',
+                  );
+                }}
+              />
+            )}
+            {view === 'settings' && (
+              <>
+                <SettingsView
+                  state={state}
+                  setState={setState}
+                  toast={toast}
+                  readOnly={!workspaceEditable}
+                />
+                <TeamControl
+                  identity={identity}
+                  signInPath={signInPath}
+                  signOutPath={signOutPath}
+                  overview={teamOverview}
+                  active={teamSession}
+                  details={teamDetails}
+                  status={teamStatus}
+                  error={teamError}
+                  onRefresh={async () => {
+                    await refreshTeam();
+                  }}
+                  onCreate={createTeamWorkspace}
+                  onOpen={openTeamWorkspace}
+                  onDisconnect={disconnectTeam}
+                  onReloadRemote={async () => {
+                    if (teamSession)
+                      await openTeamWorkspace(teamSession.workspaceId, false);
+                  }}
+                  onInvite={inviteTeam}
+                  onUpdateMember={updateTeamMemberAccess}
+                  onCancelInvite={cancelTeamInvitation}
+                />
+              </>
+            )}
+          </Suspense>
         </div>
       </section>
 
@@ -719,6 +1527,9 @@ export function CalibrationApp() {
         archiveGauge={archiveGauge}
         openCalibration={openCalibration}
         addAttachments={addAttachments}
+        addCalibrationAttachments={addCalibrationAttachments}
+        approveCalibration={approveCalibration}
+        downloadCertificate={downloadCertificate}
         goTo={goTo}
       />
       <div className="toast-stack" aria-live="polite">
@@ -1087,6 +1898,8 @@ function RegisterView({
             gauge.serial,
             gauge.location,
             gauge.custodian,
+            gauge.site,
+            gauge.department,
           ]
             .join(' ')
             .toLowerCase()
@@ -1130,6 +1943,7 @@ function RegisterView({
             'due-soon',
             'overdue',
             'conditional',
+            'restriction-expired',
             'failed',
           ] as const
         ).map((status) => {
@@ -1183,7 +1997,7 @@ function RegisterView({
               <TableRow>
                 <TableHead>Asset / instrument</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Location & owner</TableHead>
+                <TableHead>Site / location / owner</TableHead>
                 <TableHead>Last calibrated</TableHead>
                 <TableHead>Next due</TableHead>
                 <TableHead>
@@ -1214,10 +2028,14 @@ function RegisterView({
                   </TableCell>
                   <TableCell>
                     <strong className="table-primary">
-                      {gauge.location || 'Unassigned'}
+                      {[gauge.site, gauge.location]
+                        .filter(Boolean)
+                        .join(' · ') || 'Unassigned'}
                     </strong>
                     <small className="table-secondary">
-                      {gauge.custodian || 'No custodian'}
+                      {[gauge.department, gauge.custodian]
+                        .filter(Boolean)
+                        .join(' · ') || 'No custodian'}
                     </small>
                   </TableCell>
                   <TableCell>
@@ -1474,6 +2292,10 @@ function ScheduleView({
     setSending(gauge.id);
     try {
       if (state.settings.reminderWebhook) {
+        if (!isAllowedReminderWebhook(state.settings.reminderWebhook))
+          throw new Error(
+            'Reminder webhook must use HTTPS (or localhost HTTP for development).',
+          );
         const response = await fetch(state.settings.reminderWebhook, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1940,6 +2762,15 @@ function AuditView({
   exportAudit: () => void;
 }) {
   const [query, setQuery] = useState('');
+  const [certificatePdf, setCertificatePdf] = useState<File>();
+  const [certificateManifest, setCertificateManifest] = useState<File>();
+  const [verification, setVerification] = useState<{
+    valid: boolean;
+    filenameMatches: boolean;
+    digest?: string;
+    certificate?: string;
+    error?: string;
+  }>();
   const entries = [...state.audit]
     .reverse()
     .filter((entry) =>
@@ -1976,6 +2807,84 @@ function AuditView({
         </div>
         <code>SHA-256</code>
       </div>
+      <section className="panel certificate-verifier">
+        <div className="section-heading">
+          <div>
+            <h2>Independent certificate-file verification</h2>
+            <p>
+              Match a downloaded PDF to its detached GaugeBase manifest. Files
+              are hashed in this browser and are not uploaded.
+            </p>
+          </div>
+        </div>
+        <div className="verifier-inputs">
+          <label>
+            <span>Certificate PDF</span>
+            <Input
+              type="file"
+              accept="application/pdf,.pdf"
+              onChange={(event) => setCertificatePdf(event.target.files?.[0])}
+            />
+          </label>
+          <label>
+            <span>Manifest JSON</span>
+            <Input
+              type="file"
+              accept="application/json,.json"
+              onChange={(event) =>
+                setCertificateManifest(event.target.files?.[0])
+              }
+            />
+          </label>
+          <Button
+            disabled={!certificatePdf || !certificateManifest}
+            onClick={async () => {
+              if (!certificatePdf || !certificateManifest) return;
+              try {
+                const result = await verifyCertificatePair(
+                  certificatePdf,
+                  certificateManifest,
+                );
+                setVerification({
+                  valid: result.valid,
+                  filenameMatches: result.filenameMatches,
+                  digest: result.actualPdfSha256,
+                  certificate: result.manifest.certificateNumber,
+                });
+              } catch (error) {
+                setVerification({
+                  valid: false,
+                  filenameMatches: false,
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : 'Verification failed.',
+                });
+              }
+            }}
+          >
+            <ShieldCheck /> Verify file
+          </Button>
+        </div>
+        {verification && (
+          <div
+            className={`verification-result ${verification.valid ? 'valid' : 'invalid'}`}
+          >
+            {verification.valid ? <CheckCircle2 /> : <AlertTriangle />}
+            <div>
+              <strong>
+                {verification.valid
+                  ? 'PDF digest matches the detached manifest'
+                  : 'Certificate verification failed'}
+              </strong>
+              <p>
+                {verification.error ??
+                  `${verification.certificate} · ${verification.filenameMatches ? 'filename matches' : 'digest matches, but filename differs'} · SHA-256 ${verification.digest}`}
+              </p>
+            </div>
+          </div>
+        )}
+      </section>
       <section className="panel audit-panel">
         <div className="table-toolbar">
           <label>
@@ -2074,16 +2983,31 @@ function SettingsView({
   state,
   setState,
   toast,
+  readOnly = false,
 }: {
   state: AppState;
   setState: React.Dispatch<React.SetStateAction<AppState>>;
   toast: (title: string, detail?: string, tone?: ToastMessage['tone']) => void;
+  readOnly?: boolean;
 }) {
   const [password, setPassword] = useState('');
   const restoreRef = useRef<HTMLInputElement>(null);
   const saveSettings = (event: SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (readOnly)
+      return toast(
+        'Read-only team role',
+        'Workspace settings require an editing role.',
+        'warning',
+      );
     const data = new FormData(event.currentTarget);
+    const reminderWebhook = formText(data, 'reminderWebhook').trim();
+    if (!isAllowedReminderWebhook(reminderWebhook))
+      return toast(
+        'Webhook URL is not allowed',
+        'Use HTTPS, or localhost HTTP while developing.',
+        'danger',
+      );
     setState((current) => {
       const settings = {
         ...current.settings,
@@ -2092,8 +3016,15 @@ function SettingsView({
         actorEmail: formText(data, 'actorEmail'),
         qualityManagerEmail: formText(data, 'qualityManagerEmail'),
         dueSoonDays: Number(data.get('dueSoonDays')) || 30,
-        reminderWebhook: formText(data, 'reminderWebhook'),
+        reminderWebhook,
         certificatePrefix: formText(data, 'certificatePrefix') || 'GB',
+        defaultDecisionRule:
+          (formText(
+            data,
+            'defaultDecisionRule',
+          ) as AppState['settings']['defaultDecisionRule']) ||
+          'simple-acceptance',
+        guardBandMultiplier: Number(data.get('guardBandMultiplier')) || 1,
       };
       return {
         ...current,
@@ -2141,14 +3072,16 @@ function SettingsView({
     );
   };
   const restore = async (file: File) => {
+    if (readOnly)
+      return toast(
+        'Restore unavailable',
+        'Disconnect from the read-only team workspace before restoring a backup.',
+        'warning',
+      );
     try {
-      const restored = await importBackup(await file.text(), password);
-      if (
-        restored?.schemaVersion !== 1 ||
-        !Array.isArray(restored.gauges) ||
-        !Array.isArray(restored.audit)
-      )
-        throw new Error('This file is not a supported GaugeBase workspace.');
+      const restored = migrateWorkspace(
+        await importBackup(await file.text(), password),
+      );
       setState({
         ...restored,
         audit: appendAudit(restored.audit, {
@@ -2241,6 +3174,33 @@ function SettingsView({
                 maxLength={12}
               />
             </FormField>
+            <FormField label="Default conformity decision rule">
+              <select
+                name="defaultDecisionRule"
+                defaultValue={
+                  state.settings.defaultDecisionRule ?? 'guard-banded'
+                }
+              >
+                <option value="simple-acceptance">Simple acceptance</option>
+                <option value="guard-banded">Guard-banded acceptance</option>
+                <option value="uncertainty-aware">
+                  Expanded-uncertainty interval
+                </option>
+              </select>
+            </FormField>
+            <FormField
+              label="Guard-band multiplier"
+              hint="Applied to the applicable expanded uncertainty when the calibration method supplies one."
+            >
+              <Input
+                name="guardBandMultiplier"
+                type="number"
+                min="0.01"
+                max="10"
+                step="0.01"
+                defaultValue={state.settings.guardBandMultiplier ?? 1}
+              />
+            </FormField>
           </div>
         </section>
         <section className="panel settings-section">
@@ -2251,7 +3211,7 @@ function SettingsView({
             <div>
               <h2>Email reminder delivery</h2>
               <p>
-                Optional HTTP webhook for direct delivery; leave blank for
+                Optional HTTPS webhook for direct delivery; leave blank for
                 mail-client drafts.
               </p>
             </div>
@@ -2259,7 +3219,7 @@ function SettingsView({
           <div className="settings-fields one-column">
             <FormField
               label="Reminder webhook URL"
-              hint="GaugeBase sends JSON with to, subject, text, and gauge fields. Stored only on this device."
+              hint="GaugeBase sends JSON with to, subject, text, and gauge fields. Team workspaces synchronize this URL to authorized members; local workspaces keep it on this device."
             >
               <Input
                 name="reminderWebhook"
@@ -2430,6 +3390,11 @@ function GaugeDialog({
       range: formText(data, 'range').trim(),
       unit: formText(data, 'unit').trim(),
       location: formText(data, 'location').trim(),
+      site: formText(data, 'site').trim(),
+      department: formText(data, 'department').trim(),
+      criticality:
+        (formText(data, 'criticality') as GaugeRecord['criticality']) ||
+        'medium',
       custodian: formText(data, 'custodian').trim(),
       custodianEmail: formText(data, 'custodianEmail').trim(),
       intervalMonths,
@@ -2439,6 +3404,15 @@ function GaugeDialog({
       nextDue,
       lifecycle: formText(data, 'lifecycle') as GaugeRecord['lifecycle'],
       procedure: formText(data, 'procedure').trim(),
+      standardCertificateNumber: formText(
+        data,
+        'standardCertificateNumber',
+      ).trim(),
+      standardValidThrough: formText(data, 'standardValidThrough') || undefined,
+      traceabilitySource: formText(data, 'traceabilitySource').trim(),
+      restrictionReason: editing?.restrictionReason,
+      restrictionExpiry: editing?.restrictionExpiry,
+      restrictionApprovedBy: editing?.restrictionApprovedBy,
       notes: formText(data, 'notes').trim(),
       attachmentIds: editing?.attachmentIds ?? [],
       createdAt: editing?.createdAt ?? now,
@@ -2540,6 +3514,23 @@ function GaugeDialog({
               <FormField label="Location">
                 <Input name="location" defaultValue={editing?.location} />
               </FormField>
+              <FormField label="Site / facility">
+                <Input name="site" defaultValue={editing?.site} />
+              </FormField>
+              <FormField label="Department / area">
+                <Input name="department" defaultValue={editing?.department} />
+              </FormField>
+              <FormField label="Measurement criticality">
+                <select
+                  name="criticality"
+                  defaultValue={editing?.criticality ?? 'medium'}
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="critical">Critical</option>
+                </select>
+              </FormField>
               <FormField label="Custodian">
                 <Input name="custodian" defaultValue={editing?.custodian} />
               </FormField>
@@ -2602,6 +3593,38 @@ function GaugeDialog({
                 />
               </FormField>
             </div>
+            <div className="traceability-fields">
+              <div>
+                <h3>Reference-standard traceability</h3>
+                <p>
+                  Complete these fields for reference standards. GaugeBase
+                  preserves the claim and validity evidence without
+                  independently asserting traceability.
+                </p>
+              </div>
+              <div className="form-grid">
+                <FormField label="Certificate number">
+                  <Input
+                    name="standardCertificateNumber"
+                    defaultValue={editing?.standardCertificateNumber}
+                  />
+                </FormField>
+                <FormField label="Certificate valid through">
+                  <Input
+                    name="standardValidThrough"
+                    type="date"
+                    defaultValue={editing?.standardValidThrough}
+                  />
+                </FormField>
+                <FormField label="Traceability source / NMI chain">
+                  <Input
+                    name="traceabilitySource"
+                    defaultValue={editing?.traceabilitySource}
+                    placeholder="Certificate issuer and stated chain"
+                  />
+                </FormField>
+              </div>
+            </div>
             <FormField label="Notes">
               <Textarea
                 name="notes"
@@ -2655,6 +3678,7 @@ function CalibrationDialog({
       asFound: '',
       asLeft: '',
       unit: '',
+      expandedUncertainty: '',
     },
   ]);
   useEffect(() => {
@@ -2670,6 +3694,7 @@ function CalibrationDialog({
         asFound: '',
         asLeft: '',
         unit: '',
+        expandedUncertainty: '',
       },
     ]);
   }, [gaugeId]);
@@ -2685,22 +3710,78 @@ function CalibrationDialog({
     if (!gauge) return;
     const data = new FormData(event.currentTarget);
     const performedOn = formText(data, 'performedOn');
-    const usefulReadings = readings.filter((reading) =>
-      Object.entries(reading).some(([key, value]) => key !== 'id' && value),
-    );
-    if (
-      usefulReadings.some(
-        (reading) => Number(reading.lowerLimit) > Number(reading.upperLimit),
-      )
-    )
+    const readingValidation = validateReadingRows(readings);
+    if (!readingValidation.valid)
       return toast(
-        'Reading limits are invalid',
-        'Every lower limit must be less than or equal to its upper limit.',
+        'Measurement readings are incomplete',
+        `Row ${readingValidation.issues[0].row}: ${readingValidation.issues[0].message}`,
         'danger',
       );
+    const usefulReadings = readingValidation.accepted;
+    const configuredDecisionRule =
+      state.settings.defaultDecisionRule ?? 'simple-acceptance';
+    let evaluatedReadings: Reading[];
+    try {
+      evaluatedReadings = usefulReadings.map((reading) => {
+        const measuredValue = Number(reading.asLeft || reading.asFound);
+        const lowerLimit = Number(reading.lowerLimit);
+        const upperLimit = Number(reading.upperLimit);
+        const expandedUncertainty = Number(reading.expandedUncertainty);
+        const decision =
+          configuredDecisionRule === 'uncertainty-aware'
+            ? evaluateDecisionRule({
+                rule: configuredDecisionRule,
+                measuredValue,
+                lowerLimit,
+                upperLimit,
+                expandedUncertainty,
+              })
+            : configuredDecisionRule === 'guard-banded'
+              ? evaluateDecisionRule({
+                  rule: configuredDecisionRule,
+                  measuredValue,
+                  lowerLimit,
+                  upperLimit,
+                  guardBand:
+                    expandedUncertainty *
+                    (state.settings.guardBandMultiplier ?? 1),
+                })
+              : evaluateDecisionRule({
+                  rule: configuredDecisionRule,
+                  measuredValue,
+                  lowerLimit,
+                  upperLimit,
+                });
+        return {
+          ...reading,
+          decisionOutcome: decision.outcome,
+          decisionExplanation: decision.explanation,
+        };
+      });
+      if (
+        configuredDecisionRule !== 'simple-acceptance' &&
+        evaluatedReadings.some(
+          (reading) =>
+            !reading.expandedUncertainty?.trim() ||
+            !Number.isFinite(Number(reading.expandedUncertainty)) ||
+            Number(reading.expandedUncertainty) < 0,
+        )
+      )
+        throw new Error(
+          'Every evaluated point needs a non-negative expanded uncertainty for the selected decision rule.',
+        );
+    } catch (error) {
+      return toast(
+        'Decision rule could not be applied',
+        error instanceof Error
+          ? error.message
+          : 'Check the measurement inputs.',
+        'danger',
+      );
+    }
     if (
       result === 'pass' &&
-      usefulReadings.some((reading) => readingResult(reading) === 'fail')
+      evaluatedReadings.some((reading) => reading.decisionOutcome !== 'pass')
     )
       return toast(
         'Overall pass conflicts with readings',
@@ -2720,7 +3801,37 @@ function CalibrationDialog({
         'danger',
       );
     const sequence = String(state.calibrations.length + 1).padStart(4, '0');
-    const base = {
+    const createdAt = isoNow();
+    const standardIds = Array.from(data.getAll('standardIds')).filter(
+      (value): value is string => typeof value === 'string',
+    );
+    const selectedStandards = state.gauges.filter((item) =>
+      standardIds.includes(item.id),
+    );
+    const unusableStandard = selectedStandards.find(
+      (standard) =>
+        standard.type !== 'reference-standard' ||
+        standard.lifecycle !== 'active' ||
+        !standard.standardCertificateNumber?.trim() ||
+        !standard.standardValidThrough ||
+        standard.standardValidThrough < performedOn ||
+        (standard.nextDue && standard.nextDue < performedOn) ||
+        !standard.traceabilitySource?.trim(),
+    );
+    if (unusableStandard)
+      return toast(
+        'Reference standard is not eligible',
+        `${unusableStandard.assetId} must be active and have a certificate, a validity date covering ${performedOn}, and a traceability source.`,
+        'danger',
+      );
+    const base: Omit<
+      CalibrationRecord,
+      | 'certificateHash'
+      | 'recordHash'
+      | 'snapshotHash'
+      | 'gaugeSnapshot'
+      | 'lockedAt'
+    > = {
       id: uid('calibration'),
       eventNumber: `EVT-${new Date().getFullYear()}-${sequence}`,
       gaugeId: gauge.id,
@@ -2730,20 +3841,46 @@ function CalibrationDialog({
       procedureRevision: formText(data, 'procedureRevision').trim(),
       environmentalConditions: formText(data, 'environmentalConditions').trim(),
       standardReferences: formText(data, 'standardReferences').trim(),
-      readings: usefulReadings,
+      standardIds,
+      standardSnapshots: selectedStandards.map((standard) => ({
+        gaugeId: standard.id,
+        assetId: standard.assetId,
+        name: standard.name,
+        manufacturer: standard.manufacturer,
+        model: standard.model,
+        serial: standard.serial,
+        certificateNumber: standard.standardCertificateNumber ?? '',
+        validThrough: standard.standardValidThrough ?? '',
+        traceabilitySource: standard.traceabilitySource ?? '',
+        lifecycle: standard.lifecycle,
+        nextDue: standard.nextDue,
+        capturedAt: createdAt,
+      })),
+      issuerSnapshot: {
+        organizationName: state.settings.organizationName,
+        certificatePrefix: state.settings.certificatePrefix,
+        certificateFooter: state.settings.certificateFooter,
+        capturedAt: createdAt,
+      },
+      readings: evaluatedReadings,
       notes: formText(data, 'notes').trim(),
       condition: result === 'conditional' ? condition : undefined,
       restrictionExpiry:
         result === 'conditional' ? restrictionExpiry : undefined,
       approvedBy: result === 'conditional' ? approvedBy : undefined,
+      decisionRule: state.settings.defaultDecisionRule ?? 'simple-acceptance',
+      decisionRuleStatement:
+        state.settings.defaultDecisionRule === 'guard-banded'
+          ? `Guard-banded acceptance using ${state.settings.guardBandMultiplier ?? 1} × the applicable expanded uncertainty when supplied.`
+          : state.settings.defaultDecisionRule === 'uncertainty-aware'
+            ? 'Conformity is assigned only when the complete expanded-uncertainty interval supports the stated outcome.'
+            : 'Simple acceptance against the stated specification limits without guard banding.',
+      approvals: [],
       certificateNumber: `${state.settings.certificatePrefix}-${new Date().getFullYear()}-${sequence}`,
       attachmentIds: [],
-      createdAt: isoNow(),
+      createdAt,
     };
-    const record: CalibrationRecord = {
-      ...base,
-      certificateHash: hashValue(base),
-    };
+    const record = sealCalibrationRecord(gauge, base);
     const nextDue =
       result === 'fail'
         ? gauge.nextDue
@@ -2758,6 +3895,10 @@ function CalibrationDialog({
           : result === 'conditional'
             ? 'restricted'
             : 'active',
+      restrictionReason: result === 'conditional' ? condition : undefined,
+      restrictionExpiry:
+        result === 'conditional' ? restrictionExpiry : undefined,
+      restrictionApprovedBy: result === 'conditional' ? approvedBy : undefined,
       updatedAt: isoNow(),
     };
     onSave(record, updatedGauge);
@@ -2879,14 +4020,46 @@ function CalibrationDialog({
                 required
               />
             </FormField>
+            <FormField
+              label="Linked reference-standard records"
+              hint="Select controlled standards to create a queryable traceability chain. Use Ctrl/Cmd to select more than one."
+            >
+              <select
+                name="standardIds"
+                multiple
+                size={Math.min(
+                  4,
+                  Math.max(
+                    2,
+                    state.gauges.filter(
+                      (item) => item.type === 'reference-standard',
+                    ).length,
+                  ),
+                )}
+              >
+                {state.gauges
+                  .filter((item) => item.type === 'reference-standard')
+                  .map((standard) => (
+                    <option key={standard.id} value={standard.id}>
+                      {standard.assetId} · {standard.name} ·{' '}
+                      {stateLabel(getCalibrationState(standard))}
+                    </option>
+                  ))}
+              </select>
+            </FormField>
           </div>
           <div className="form-section">
             <div className="section-heading">
               <div>
                 <h3>Measurement readings</h3>
                 <p>
-                  Optional for summary records. As-left is evaluated when
-                  present; otherwise as-found.
+                  Optional for summary records. Detailed points use the{' '}
+                  <strong>
+                    {(
+                      state.settings.defaultDecisionRule ?? 'simple-acceptance'
+                    ).replaceAll('-', ' ')}
+                  </strong>{' '}
+                  rule; as-left is evaluated when present.
                 </p>
               </div>
               <Button
@@ -2905,6 +4078,7 @@ function CalibrationDialog({
                       asFound: '',
                       asLeft: '',
                       unit: gauge?.unit ?? '',
+                      expandedUncertainty: '',
                     },
                   ])
                 }
@@ -2921,6 +4095,7 @@ function CalibrationDialog({
                 <span>Upper</span>
                 <span>As found</span>
                 <span>As left</span>
+                <span>Expanded U</span>
                 <span>Unit</span>
                 <span />
               </div>
@@ -2985,6 +4160,19 @@ function CalibrationDialog({
                     onChange={(event) =>
                       updateReading(reading.id, 'asLeft', event.target.value)
                     }
+                  />
+                  <Input
+                    aria-label="Expanded uncertainty"
+                    inputMode="decimal"
+                    value={reading.expandedUncertainty ?? ''}
+                    onChange={(event) =>
+                      updateReading(
+                        reading.id,
+                        'expandedUncertainty',
+                        event.target.value,
+                      )
+                    }
+                    placeholder="U"
                   />
                   <Input
                     aria-label="Unit"
@@ -3079,6 +4267,15 @@ function ImportDialog({
   const [preview, setPreview] = useState<CsvPreview>();
   const [filename, setFilename] = useState('');
   const readFile = async (file: File) => {
+    if (file.size > 10_000_000) {
+      setFilename(file.name);
+      setPreview({
+        rows: [],
+        errors: ['The file exceeds the enforced 10 MB import limit.'],
+        total: 0,
+      });
+      return;
+    }
     setFilename(file.name);
     setPreview(parseGaugeCsv(await file.text(), state.gauges));
   };
@@ -3236,6 +4433,9 @@ function GaugeDetailSheet({
   archiveGauge,
   openCalibration,
   addAttachments,
+  addCalibrationAttachments,
+  approveCalibration,
+  downloadCertificate,
   goTo,
 }: {
   gauge?: GaugeRecord;
@@ -3246,6 +4446,15 @@ function GaugeDetailSheet({
   archiveGauge: (gauge: GaugeRecord) => void;
   openCalibration: (id?: string) => void;
   addAttachments: (gauge: GaugeRecord, files: FileList) => Promise<void>;
+  addCalibrationAttachments: (
+    calibration: CalibrationRecord,
+    files: FileList,
+  ) => Promise<void>;
+  approveCalibration: (calibration: CalibrationRecord) => void;
+  downloadCertificate: (
+    calibration: CalibrationRecord,
+    gauge: GaugeRecord,
+  ) => Promise<void>;
   goTo: (view: View) => void;
 }) {
   if (!gauge) return null;
@@ -3407,7 +4616,10 @@ function GaugeDetailSheet({
                   <button
                     key={attachment.id}
                     onClick={() =>
-                      downloadAttachment(attachment.dataUrl, attachment.name)
+                      downloadAttachment(
+                        attachment.downloadUrl || attachment.dataUrl,
+                        attachment.name,
+                      )
                     }
                   >
                     <span>
@@ -3443,36 +4655,120 @@ function GaugeDetailSheet({
               </div>
             ) : (
               <div className="record-timeline">
-                {records.map((record) => (
-                  <article key={record.id}>
-                    <span className={`record-node ${record.result}`} />
-                    <div>
-                      <div>
-                        <code>{record.eventNumber}</code>
-                        <span className={`result-pill ${record.result}`}>
-                          {record.result === 'conditional'
-                            ? 'Conditional pass'
-                            : record.result}
-                        </span>
-                      </div>
-                      <strong>{formatDate(record.performedOn)}</strong>
-                      <p>
-                        {record.technician} · {record.procedureRevision}
-                      </p>
-                      {record.condition && <small>{record.condition}</small>}
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      onClick={() =>
-                        generateCertificatePdf(state, record, gauge)
-                      }
-                      aria-label={`Download ${record.certificateNumber}`}
+                {records.map((record) => {
+                  const evidence = state.attachments.filter((attachment) =>
+                    record.attachmentIds.includes(attachment.id),
+                  );
+                  const recordIntegrity = verifySealedCalibration(record);
+                  return (
+                    <article
+                      key={record.id}
+                      className="calibration-record-card"
                     >
-                      <FileDown />
-                    </Button>
-                  </article>
-                ))}
+                      <span className={`record-node ${record.result}`} />
+                      <div>
+                        <div>
+                          <code>{record.eventNumber}</code>
+                          <span className={`result-pill ${record.result}`}>
+                            {record.result === 'conditional'
+                              ? 'Conditional pass'
+                              : record.result}
+                          </span>
+                        </div>
+                        <strong>{formatDate(record.performedOn)}</strong>
+                        <p>
+                          {record.technician} · {record.procedureRevision}
+                        </p>
+                        {record.condition && <small>{record.condition}</small>}
+                        <span
+                          className={`record-integrity-line ${recordIntegrity.valid ? 'valid' : 'invalid'}`}
+                          title={recordIntegrity.reason}
+                        >
+                          {recordIntegrity.valid ? (
+                            <ShieldCheck />
+                          ) : (
+                            <AlertTriangle />
+                          )}{' '}
+                          {recordIntegrity.valid
+                            ? 'sealed'
+                            : 'integrity warning'}{' '}
+                          ·{' '}
+                          {record.recordHash?.slice(0, 12) ??
+                            record.certificateHash.slice(0, 12)}
+                          …
+                        </span>
+                        {(record.approvals?.length ?? 0) > 0 && (
+                          <span className="record-approval-line">
+                            <ShieldCheck /> {record.approvals?.length} technical
+                            review{record.approvals?.length === 1 ? '' : 's'}
+                          </span>
+                        )}
+                        {evidence.length > 0 && (
+                          <div className="record-evidence">
+                            {evidence.map((attachment) => (
+                              <button
+                                key={attachment.id}
+                                onClick={() =>
+                                  downloadAttachment(
+                                    attachment.downloadUrl ||
+                                      attachment.dataUrl,
+                                    attachment.name,
+                                  )
+                                }
+                              >
+                                <Paperclip /> {attachment.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="record-actions">
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => approveCalibration(record)}
+                          disabled={record.approvals?.some(
+                            (approval) =>
+                              approval.signerEmail &&
+                              approval.signerEmail ===
+                                state.settings.actorEmail &&
+                              approval.meaning === 'technical-review',
+                          )}
+                          aria-label={`Technically review ${record.certificateNumber}`}
+                          title="Bind a technical review to this record hash"
+                        >
+                          <ShieldCheck />
+                        </Button>
+                        <label
+                          className="record-attach"
+                          title="Attach calibration evidence"
+                        >
+                          <Paperclip />
+                          <input
+                            type="file"
+                            multiple
+                            accept=".pdf,.doc,.docx,image/*,.csv,.txt"
+                            onChange={(event) =>
+                              event.target.files &&
+                              addCalibrationAttachments(
+                                record,
+                                event.target.files,
+                              )
+                            }
+                          />
+                        </label>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => downloadCertificate(record, gauge)}
+                          aria-label={`Download ${record.certificateNumber}`}
+                        >
+                          <FileDown />
+                        </Button>
+                      </div>
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>

@@ -26,7 +26,13 @@ jobs:
         run: npm run typecheck
       - name: Lint
         run: npm run lint
+      - name: Check formatting
+        run: npm run format:check
       - name: Unit tests
         run: npm test
+      - name: Validate database migrations
+        run: npx drizzle-kit check
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
       - name: Production build
         run: npm run build

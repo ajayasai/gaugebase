@@ -7,6 +7,7 @@ export type CalibrationState =
   | 'overdue'
   | 'failed'
   | 'conditional'
+  | 'restriction-expired'
   | 'not-required';
 export type LifecycleStatus =
   | 'active'
@@ -37,6 +38,15 @@ export interface GaugeRecord {
   lifecycle: LifecycleStatus;
   procedure: string;
   notes: string;
+  site?: string;
+  department?: string;
+  criticality?: 'low' | 'medium' | 'high' | 'critical';
+  standardCertificateNumber?: string;
+  standardValidThrough?: string;
+  traceabilitySource?: string;
+  restrictionReason?: string;
+  restrictionExpiry?: string;
+  restrictionApprovedBy?: string;
   attachmentIds: string[];
   createdAt: string;
   updatedAt: string;
@@ -51,6 +61,9 @@ export interface Reading {
   asFound: string;
   asLeft: string;
   unit: string;
+  expandedUncertainty?: string;
+  decisionOutcome?: 'pass' | 'fail' | 'conditional' | 'indeterminate';
+  decisionExplanation?: string;
 }
 
 export interface CalibrationRecord {
@@ -63,6 +76,9 @@ export interface CalibrationRecord {
   procedureRevision: string;
   environmentalConditions: string;
   standardReferences: string;
+  standardIds?: string[];
+  standardSnapshots?: CalibrationStandardSnapshot[];
+  issuerSnapshot?: CalibrationIssuerSnapshot;
   readings: Reading[];
   notes: string;
   condition?: string;
@@ -70,8 +86,68 @@ export interface CalibrationRecord {
   approvedBy?: string;
   certificateNumber: string;
   certificateHash: string;
+  recordHash?: string;
+  snapshotHash?: string;
+  gaugeSnapshot?: CalibrationGaugeSnapshot;
+  decisionRule?: 'simple-acceptance' | 'guard-banded' | 'uncertainty-aware';
+  decisionRuleStatement?: string;
+  supersedesId?: string;
+  approvals?: CalibrationApproval[];
+  lockedAt?: string;
   attachmentIds: string[];
   createdAt: string;
+}
+
+export interface CalibrationStandardSnapshot {
+  gaugeId: string;
+  assetId: string;
+  name: string;
+  manufacturer: string;
+  model: string;
+  serial: string;
+  certificateNumber: string;
+  validThrough: string;
+  traceabilitySource: string;
+  lifecycle: GaugeRecord['lifecycle'];
+  nextDue?: string;
+  capturedAt: string;
+}
+
+export interface CalibrationIssuerSnapshot {
+  organizationName: string;
+  certificatePrefix: string;
+  certificateFooter: string;
+  capturedAt: string;
+}
+
+export interface CalibrationGaugeSnapshot {
+  gaugeId: string;
+  assetId: string;
+  name: string;
+  type: GaugeRecord['type'];
+  manufacturer: string;
+  model: string;
+  serial: string;
+  range: string;
+  unit: string;
+  location: string;
+  site: string;
+  department: string;
+  procedure: string;
+  capturedAt: string;
+  source: 'completion' | 'legacy-migration';
+}
+
+export interface CalibrationApproval {
+  id: string;
+  meaning: 'technical-review' | 'release' | 'conditional-use';
+  signerName: string;
+  signerUserId?: string;
+  signerEmail?: string;
+  signerRole?: string;
+  signedAt: string;
+  recordHash: string;
+  assurance: 'local-assertion' | 'authenticated-identity';
 }
 
 export interface AttachmentRecord {
@@ -80,6 +156,8 @@ export interface AttachmentRecord {
   type: string;
   size: number;
   dataUrl: string;
+  storage?: 'local' | 'team';
+  downloadUrl?: string;
   sha256: string;
   createdAt: string;
   targetType: 'gauge' | 'calibration';
@@ -106,13 +184,53 @@ export interface AuditEntry {
     | 'settings'
     | 'import'
     | 'export'
-    | 'backup';
+    | 'backup'
+    | 'quality-case'
+    | 'technical-study'
+    | 'approval'
+    | 'team';
   entityId: string;
   summary: string;
+  assurance?: 'local' | 'authenticated-identity';
   before?: unknown;
   after?: unknown;
   previousHash: string;
   hash: string;
+}
+
+export interface QualityCase {
+  id: string;
+  caseNumber: string;
+  type: 'out-of-tolerance' | 'recall' | 'deviation' | 'capa';
+  status: 'open' | 'investigating' | 'contained' | 'closed';
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  title: string;
+  description: string;
+  gaugeId?: string;
+  calibrationId?: string;
+  owner: string;
+  dueDate?: string;
+  impactWindowStart?: string;
+  impactWindowEnd?: string;
+  affectedGaugeIds: string[];
+  disposition?: string;
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;
+}
+
+export interface TechnicalStudyRecord {
+  id: string;
+  kind: 'uncertainty-budget' | 'gage-rr' | 'bias' | 'linearity' | 'stability';
+  title: string;
+  gaugeId?: string;
+  status: 'draft' | 'reviewed' | 'approved';
+  input: unknown;
+  result: unknown;
+  createdBy: string;
+  reviewedBy?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface WorkspaceSettings {
@@ -124,16 +242,23 @@ export interface WorkspaceSettings {
   reminderWebhook: string;
   certificatePrefix: string;
   certificateFooter: string;
+  defaultDecisionRule?:
+    | 'simple-acceptance'
+    | 'guard-banded'
+    | 'uncertainty-aware';
+  guardBandMultiplier?: number;
   reminderRules: ReminderRule[];
   lastBackupAt?: string;
 }
 
 export interface AppState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   gauges: GaugeRecord[];
   calibrations: CalibrationRecord[];
   attachments: AttachmentRecord[];
   audit: AuditEntry[];
+  qualityCases: QualityCase[];
+  technicalStudies: TechnicalStudyRecord[];
   settings: WorkspaceSettings;
 }
 
@@ -202,7 +327,11 @@ export function addMonthsClamped(value: string, months: number) {
 
 export function getCalibrationState(gauge: GaugeRecord): CalibrationState {
   if (gauge.lifecycle === 'out-of-service') return 'failed';
-  if (gauge.lifecycle === 'restricted') return 'conditional';
+  if (gauge.lifecycle === 'restricted') {
+    if (gauge.restrictionExpiry && daysUntil(gauge.restrictionExpiry) < 0)
+      return 'restriction-expired';
+    return 'conditional';
+  }
   if (gauge.lifecycle === 'inactive' || gauge.lifecycle === 'retired')
     return 'not-required';
   const remaining = daysUntil(gauge.nextDue);
@@ -218,6 +347,7 @@ export function stateLabel(state: CalibrationState) {
     overdue: 'Overdue',
     failed: 'Out of service',
     conditional: 'Restricted use',
+    'restriction-expired': 'Restriction expired',
     'not-required': 'Inactive',
   }[state];
 }
@@ -236,6 +366,49 @@ export function formatDate(
 
 export function hashValue(value: unknown) {
   return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify(value))));
+}
+
+function canonicalize(value: unknown, seen: WeakSet<object>): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean')
+    return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value))
+      throw new TypeError(
+        'Canonical records cannot contain non-finite numbers.',
+      );
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'undefined') return undefined;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value))
+    return value.map((item) => canonicalize(item, seen) ?? null);
+  if (typeof value === 'object') {
+    if (seen.has(value))
+      throw new TypeError('Circular record data is invalid.');
+    seen.add(value);
+    const output: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      const normalized = canonicalize(
+        (value as Record<string, unknown>)[key],
+        seen,
+      );
+      if (normalized !== undefined) output[key] = normalized;
+    }
+    seen.delete(value);
+    return output;
+  }
+  throw new TypeError(`Unsupported canonical record value: ${typeof value}.`);
+}
+
+export function canonicalHashValue(value: unknown) {
+  return bytesToHex(
+    sha256(
+      new TextEncoder().encode(
+        JSON.stringify(canonicalize(value, new WeakSet())),
+      ),
+    ),
+  );
 }
 
 export function appendAudit(
@@ -264,10 +437,18 @@ export function verifyAuditChain(entries: AuditEntry[]) {
 }
 
 export function readingResult(reading: Reading) {
-  const value = Number(reading.asLeft || reading.asFound);
+  const measured = reading.asLeft.trim() || reading.asFound.trim();
+  if (
+    !reading.asFound.trim() ||
+    !reading.lowerLimit.trim() ||
+    !reading.upperLimit.trim() ||
+    !measured
+  )
+    return 'not-evaluated';
+  const value = Number(measured);
   const low = Number(reading.lowerLimit);
   const high = Number(reading.upperLimit);
-  if ([value, low, high].some(Number.isNaN) || !reading.asFound)
+  if (![value, low, high].every(Number.isFinite) || low > high)
     return 'not-evaluated';
   return value >= low && value <= high ? 'pass' : 'fail';
 }
@@ -464,6 +645,9 @@ export function createSeedState(): AppState {
       lifecycle: 'restricted',
       procedure: 'CAL-DIM-08 · Rev B',
       notes: 'Restricted to measurements below 300 mm pending review.',
+      restrictionReason: 'Use only for measurements at or below 300 mm.',
+      restrictionExpiry: dateFromToday(20),
+      restrictionApprovedBy: 'Alex Kim',
       attachmentIds: [],
       createdAt: created,
       updatedAt: created,
@@ -560,6 +744,83 @@ export function createSeedState(): AppState {
     },
   ];
 
+  const sealedCalibrations = calibrations.map((calibration) => {
+    const gauge = gauges.find((item) => item.id === calibration.gaugeId)!;
+    const gaugeSnapshot: CalibrationGaugeSnapshot = {
+      gaugeId: gauge.id,
+      assetId: gauge.assetId,
+      name: gauge.name,
+      type: gauge.type,
+      manufacturer: gauge.manufacturer,
+      model: gauge.model,
+      serial: gauge.serial,
+      range: gauge.range,
+      unit: gauge.unit,
+      location: gauge.location,
+      site: gauge.site ?? '',
+      department: gauge.department ?? '',
+      procedure: gauge.procedure,
+      capturedAt: calibration.createdAt,
+      source: 'completion',
+    };
+    const snapshotHash = canonicalHashValue(gaugeSnapshot);
+    const enrichedCalibration = {
+      ...calibration,
+      readings: calibration.readings.map((reading) => {
+        const observed = Number(reading.asLeft || reading.asFound);
+        const lower = Number(reading.lowerLimit);
+        const upper = Number(reading.upperLimit);
+        const withinLimits = observed >= lower && observed <= upper;
+        const decisionOutcome = withinLimits
+          ? ('pass' as const)
+          : calibration.result === 'conditional'
+            ? ('conditional' as const)
+            : ('fail' as const);
+        return {
+          ...reading,
+          decisionOutcome,
+          decisionExplanation: withinLimits
+            ? 'Stored value is within the stated limits under simple acceptance.'
+            : calibration.result === 'conditional'
+              ? 'Stored value is outside the stated limits; use is limited by the documented conditional approval.'
+              : 'Stored value is outside the stated limits under simple acceptance.',
+        };
+      }),
+      standardIds: calibration.standardIds ?? [],
+      standardSnapshots: calibration.standardSnapshots ?? [],
+      issuerSnapshot: {
+        organizationName: 'Northstar Manufacturing',
+        certificatePrefix: 'GB',
+        certificateFooter: COMPLIANCE_DISCLAIMER,
+        capturedAt: calibration.createdAt,
+      },
+      decisionRule: 'simple-acceptance' as const,
+      decisionRuleStatement:
+        'Simple acceptance against the stated specification limits without guard banding.',
+      approvals: [],
+    };
+    const {
+      certificateHash: _certificateHash,
+      attachmentIds: _attachmentIds,
+      approvals: _approvals,
+      ...immutableCalibration
+    } = enrichedCalibration;
+    const recordHash = canonicalHashValue({
+      ...immutableCalibration,
+      gaugeSnapshot,
+      snapshotHash,
+      lockedAt: calibration.createdAt,
+    });
+    return {
+      ...enrichedCalibration,
+      gaugeSnapshot,
+      snapshotHash,
+      recordHash,
+      certificateHash: recordHash,
+      lockedAt: calibration.createdAt,
+    };
+  });
+
   const audit = seedAudit([
     {
       timestamp: new Date(Date.now() - 73 * 86_400_000).toISOString(),
@@ -591,11 +852,33 @@ export function createSeedState(): AppState {
   ]);
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     gauges,
-    calibrations,
+    calibrations: sealedCalibrations,
     attachments: [],
     audit,
+    qualityCases: [
+      {
+        id: 'case-oos-001',
+        caseNumber: 'Q-2026-0001',
+        type: 'out-of-tolerance',
+        status: 'investigating',
+        severity: 'high',
+        title: 'Height gauge restricted above 300 mm',
+        description:
+          'Review measurements made above the approved restriction and document product impact.',
+        gaugeId: 'gauge-dim-071',
+        calibrationId: 'cal-dim-071',
+        owner: 'Alex Kim',
+        dueDate: dateFromToday(10),
+        impactWindowStart: dateFromToday(-40),
+        impactWindowEnd: todayIso(),
+        affectedGaugeIds: [],
+        createdAt: created,
+        updatedAt: created,
+      },
+    ],
+    technicalStudies: [],
     settings: {
       organizationName: 'Northstar Manufacturing',
       actorName: 'Alex Kim',
@@ -605,6 +888,8 @@ export function createSeedState(): AppState {
       reminderWebhook: '',
       certificatePrefix: 'GB',
       certificateFooter: COMPLIANCE_DISCLAIMER,
+      defaultDecisionRule: 'guard-banded',
+      guardBandMultiplier: 1,
       reminderRules: [
         { id: 'rem-30', offsetDays: 30, recipient: 'custodian', active: true },
         { id: 'rem-7', offsetDays: 7, recipient: 'custodian', active: true },
