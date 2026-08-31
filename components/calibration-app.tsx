@@ -195,15 +195,28 @@ function isAllowedReminderWebhook(value: string) {
   }
 }
 
-const navItems: Array<{ key: View; label: string; icon: typeof Gauge }> = [
-  { key: 'dashboard', label: 'Overview', icon: LayoutDashboard },
-  { key: 'register', label: 'Gauge register', icon: Gauge },
-  { key: 'calibrations', label: 'Calibrations', icon: ClipboardCheck },
-  { key: 'schedule', label: 'Schedule', icon: CalendarClock },
-  { key: 'metrology', label: 'Metrology lab', icon: Microscope },
-  { key: 'quality', label: 'Quality center', icon: ShieldAlert },
-  { key: 'labels', label: 'Labels', icon: QrCode },
-  { key: 'audit', label: 'Audit log', icon: History },
+const navGroups: Array<{
+  label: string;
+  items: Array<{ key: View; label: string; icon: typeof Gauge }>;
+}> = [
+  {
+    label: 'Operations',
+    items: [
+      { key: 'dashboard', label: 'Overview', icon: LayoutDashboard },
+      { key: 'register', label: 'Gauge register', icon: Gauge },
+      { key: 'calibrations', label: 'Calibrations', icon: ClipboardCheck },
+      { key: 'schedule', label: 'Schedule', icon: CalendarClock },
+    ],
+  },
+  {
+    label: 'Assurance',
+    items: [
+      { key: 'metrology', label: 'Metrology lab', icon: Microscope },
+      { key: 'quality', label: 'Quality center', icon: ShieldAlert },
+      { key: 'labels', label: 'Labels', icon: QrCode },
+      { key: 'audit', label: 'Audit log', icon: History },
+    ],
+  },
 ];
 
 function calibrationTone(gauge: GaugeRecord) {
@@ -301,6 +314,9 @@ export function CalibrationApp({
   const [teamStatus, setTeamStatus] = useState<TeamSyncStatus>('local');
   const [teamError, setTeamError] = useState<string>();
   const searchRef = useRef<HTMLInputElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const mobileMenuRef = useRef<HTMLButtonElement>(null);
+  const mobileCloseRef = useRef<HTMLButtonElement>(null);
   const localStateBeforeTeam = useRef<AppState | undefined>(undefined);
   const restoredTeamOnce = useRef(false);
   const workspaceEditable =
@@ -612,6 +628,45 @@ export function CalibrationApp({
     window.addEventListener('keydown', listener);
     return () => window.removeEventListener('keydown', listener);
   }, []);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const focusFrame = window.requestAnimationFrame(() =>
+      mobileCloseRef.current?.focus(),
+    );
+    const listener = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setMobileNavOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab' || !sidebarRef.current) return;
+      const focusable = Array.from(
+        sidebarRef.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => element.offsetParent !== null);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', listener);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener('keydown', listener);
+      document.body.style.overflow = previousOverflow;
+      mobileMenuRef.current?.focus();
+    };
+  }, [mobileNavOpen]);
 
   const selectedGauge = state.gauges.find(
     (gauge) => gauge.id === selectedGaugeId,
@@ -1096,7 +1151,11 @@ export function CalibrationApp({
 
   return (
     <main className="app-shell full-app">
-      <aside className={`sidebar ${mobileNavOpen ? 'mobile-open' : ''}`}>
+      <aside
+        ref={sidebarRef}
+        id="primary-navigation"
+        className={`sidebar ${mobileNavOpen ? 'mobile-open' : ''}`}
+      >
         <div className="brand">
           <span className="brand-mark">
             <Gauge size={20} strokeWidth={2.25} />
@@ -1106,6 +1165,7 @@ export function CalibrationApp({
             <small>Calibration control</small>
           </span>
           <button
+            ref={mobileCloseRef}
             className="mobile-close"
             onClick={() => setMobileNavOpen(false)}
             aria-label="Close navigation"
@@ -1114,19 +1174,24 @@ export function CalibrationApp({
           </button>
         </div>
         <nav aria-label="Primary navigation">
-          <p className="nav-label">Workspace</p>
-          {navItems.map(({ key, label, icon: Icon }) => (
-            <button
-              className={`nav-item ${view === key ? 'active' : ''}`}
-              key={key}
-              onClick={() => goTo(key)}
-            >
-              <Icon size={18} />
-              <span>{label}</span>
-              {key === 'calibrations' && counts.overdue > 0 && (
-                <em>{counts.overdue}</em>
-              )}
-            </button>
+          {navGroups.map((group) => (
+            <div className="nav-group" key={group.label}>
+              <p className="nav-label">{group.label}</p>
+              {group.items.map(({ key, label, icon: Icon }) => (
+                <button
+                  className={`nav-item ${view === key ? 'active' : ''}`}
+                  key={key}
+                  onClick={() => goTo(key)}
+                  aria-current={view === key ? 'page' : undefined}
+                >
+                  <Icon size={18} />
+                  <span>{label}</span>
+                  {key === 'calibrations' && counts.overdue > 0 && (
+                    <em>{counts.overdue}</em>
+                  )}
+                </button>
+              ))}
+            </div>
           ))}
         </nav>
         <div className="sidebar-bottom">
@@ -1179,6 +1244,14 @@ export function CalibrationApp({
         </div>
       </aside>
 
+      {mobileNavOpen && (
+        <button
+          className="sidebar-backdrop"
+          onClick={() => setMobileNavOpen(false)}
+          aria-label="Close navigation"
+        />
+      )}
+
       <section className="workspace">
         {storageError && (
           <div className="storage-error-banner" role="alert">
@@ -1204,12 +1277,28 @@ export function CalibrationApp({
         )}
         <header className="topbar">
           <button
+            ref={mobileMenuRef}
             className="mobile-menu"
             onClick={() => setMobileNavOpen(true)}
             aria-label="Open navigation"
+            aria-controls="primary-navigation"
+            aria-expanded={mobileNavOpen}
           >
             <Menu size={19} />
           </button>
+          <div className="topbar-context">
+            <span className="workspace-state-icon">
+              {teamSession ? <Users size={17} /> : <Database size={17} />}
+            </span>
+            <span>
+              <small>
+                {teamSession ? 'Team workspace' : 'Private workspace'}
+              </small>
+              <strong>
+                {teamSession?.name ?? 'Calibration command center'}
+              </strong>
+            </span>
+          </div>
           <div className="global-search-wrap">
             <label className="search-box">
               <Search size={18} />
@@ -1701,36 +1790,31 @@ function DashboardView({
               />
             ) : (
               queue.map((gauge) => (
-                <article
-                  className="gauge-row"
-                  key={gauge.id}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ')
-                      openGauge(gauge.id);
-                  }}
-                  onClick={() => openGauge(gauge.id)}
-                >
+                <article className="gauge-row" key={gauge.id}>
                   <span className={`status-rail ${calibrationTone(gauge)}`} />
-                  <span className="gauge-symbol">
-                    <Gauge size={19} />
-                  </span>
-                  <div className="gauge-details">
-                    <div>
-                      <code>{gauge.assetId}</code>
-                      <StatusPill gauge={gauge} />
+                  <button
+                    className="gauge-open"
+                    onClick={() => openGauge(gauge.id)}
+                    aria-label={`Open ${gauge.assetId} ${gauge.name}`}
+                  >
+                    <span className="gauge-symbol">
+                      <Gauge size={19} />
+                    </span>
+                    <div className="gauge-details">
+                      <div>
+                        <code>{gauge.assetId}</code>
+                        <StatusPill gauge={gauge} />
+                      </div>
+                      <h3>{gauge.name}</h3>
+                      <p>
+                        {gauge.manufacturer} · {gauge.location}
+                      </p>
                     </div>
-                    <h3>{gauge.name}</h3>
-                    <p>
-                      {gauge.manufacturer} · {gauge.location}
-                    </p>
-                  </div>
+                  </button>
                   <div className="due-date">
                     <strong>{dueLabel(gauge)}</strong>
                     <button
-                      onClick={(event) => {
-                        event.stopPropagation();
+                      onClick={() => {
                         openCalibration(gauge.id);
                       }}
                     >
@@ -1958,6 +2042,7 @@ function RegisterView({
               key={status}
               className={filter === status ? 'active' : ''}
               onClick={() => setFilter(status)}
+              aria-pressed={filter === status}
             >
               <span className={`summary-dot ${status}`} />
               {status === 'all'
@@ -1978,6 +2063,7 @@ function RegisterView({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Filter this register…"
+              aria-label="Filter the gauge register"
             />
           </label>
           <span>
@@ -1992,7 +2078,7 @@ function RegisterView({
             detail="Try a broader search or another status filter."
           />
         ) : (
-          <Table className="register-table">
+          <Table className="register-table" aria-label="Gauge register">
             <TableHeader>
               <TableRow>
                 <TableHead>Asset / instrument</TableHead>
@@ -2162,6 +2248,7 @@ function CalibrationsView({
                 key={item}
                 className={resultFilter === item ? 'active' : ''}
                 onClick={() => setResultFilter(item)}
+                aria-pressed={resultFilter === item}
               >
                 {item === 'all'
                   ? 'All results'
@@ -2180,7 +2267,10 @@ function CalibrationsView({
             detail="Record a completed calibration to start immutable history."
           />
         ) : (
-          <Table className="register-table calibration-table">
+          <Table
+            className="register-table calibration-table"
+            aria-label="Calibration records"
+          >
             <TableHeader>
               <TableRow>
                 <TableHead>Event</TableHead>
@@ -2893,6 +2983,7 @@ function AuditView({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search actors, actions, records…"
+              aria-label="Search the audit log"
             />
           </label>
           <span>

@@ -407,6 +407,7 @@ export function QualityCenter({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search cases…"
+              aria-label="Search quality cases"
             />
           </label>
         </div>

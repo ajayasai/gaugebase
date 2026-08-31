@@ -2,6 +2,17 @@
 
 All notable changes are documented here. GaugeBase follows Semantic Versioning from 1.0 onward.
 
+## 1.1.0 — 2026-08-31
+
+### Interface and accessibility
+
+- Refined the application around a precision-instrument visual system with a modern forest-and-lime palette, layered surfaces, stronger hierarchy, and a sticky translucent workspace bar.
+- Increased typography, control, table, form, and status-label sizing throughout calibration, metrology, quality, audit, settings, and team workflows.
+- Reorganized primary navigation into operations and assurance groups, added clearer workspace context, and improved focus, hover, and reduced-motion behavior.
+- Rebuilt the mobile navigation as an accessible focus-trapped drawer with Escape and backdrop dismissal, restored mobile quick actions, and kept the add-gauge action available on small screens.
+- Improved dashboard metrics, priority records, program-health panels, data tables, dialogs, sheets, and technical forms without changing controlled record behavior.
+- Added accessible names and pressed states to key searches, filters, and tables, and restored keyboard focusability for calibration outcome and attachment controls.
+
 ## 1.0.0 — 2026-08-31
 
 ### Calibration and record integrity
