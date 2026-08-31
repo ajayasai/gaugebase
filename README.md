@@ -6,7 +6,7 @@
 
 **Open-source, local-first calibration record management with portable data and tamper-evident history.**
 
-Live application: `LIVE_URL_PENDING`
+**[Open the live application](https://gaugebase.ajaiasai.chatgpt.site)**
 
 GaugeBase gives quality teams a fast instrument register, due-work dashboard, calibration workflow, certificates, labels, reminders, attachments, migration tools, backups, and complete change history—without a vendor account, seat limit, or proprietary data format.
 

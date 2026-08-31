@@ -246,18 +246,19 @@ export function CalibrationApp() {
       .catch(() => setHydrated(true));
     if ('serviceWorker' in navigator)
       navigator.serviceWorker.register('./sw.js').catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
     const params = new URLSearchParams(window.location.hash.slice(1));
     const token = params.get('asset');
-    if (token) {
-      const match = createSeedState().gauges.find(
-        (gauge) => gauge.token === token,
-      );
-      if (match) {
-        setSelectedGaugeId(match.id);
-        setView('register');
-      }
+    if (!token) return;
+    const match = state.gauges.find((gauge) => gauge.token === token);
+    if (match) {
+      setSelectedGaugeId(match.id);
+      setView('register');
     }
-  }, []);
+  }, [hydrated, state.gauges]);
 
   useEffect(() => {
     if (hydrated)
@@ -1650,20 +1651,28 @@ function ScheduleView({
                   <input
                     type="checkbox"
                     checked={rule.active}
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const active = event.target.checked;
                       setState((current) => ({
                         ...current,
                         settings: {
                           ...current.settings,
                           reminderRules: current.settings.reminderRules.map(
                             (item) =>
-                              item.id === rule.id
-                                ? { ...item, active: event.target.checked }
-                                : item,
+                              item.id === rule.id ? { ...item, active } : item,
                           ),
                         },
-                      }))
-                    }
+                        audit: appendAudit(current.audit, {
+                          actor: current.settings.actorName,
+                          action: 'reminder.rule_updated',
+                          entityType: 'settings',
+                          entityId: rule.id,
+                          summary: `${rule.offsetDays === 0 ? 'Due-date' : `${rule.offsetDays}-day`} reminder ${active ? 'enabled' : 'disabled'}`,
+                          before: { active: rule.active },
+                          after: { active },
+                        }),
+                      }));
+                    }}
                   />
                   <span>
                     <strong>
